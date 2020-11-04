@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  A CloudFormation Stack that sets up the components for the Craps On AWS
+  Step Functions Lab.
+Resources:
+  CrapsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: >-
+        The AWS IAM Role that will be used by the Lambdas in the project. Allows
+        writing to AWS Cloudwatch Logs
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  CrapsStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: >-
+        The AWS IAM Role that will be used by the State Machine in the project.
+        Allows invoking the Lambdas used in the project
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+              - 'arn:aws:iam::aws:policy/service-role/AWSLambdaRole'
+
+  CrapsDiceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CrapsLambdaRole.Arn
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import random
+          import uuid
+
+          # initialize variables that need to persist between lambda invocations
+          # in global scope (eg: rest client, DynamoDB client, etc...)
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          logger.info("Lambda was cold. Generating unique seed.")
+
+          # generate a random seed using a uuid
+          unique_seed = str(uuid.uuid4())
+          random.seed(a=unique_seed)
+          logger.info("using seed: %s" % unique_seed)
+
+          def lambda_handler(event, context):
+              roll = random.randint(1,6)
+
+              return_value = {
+                  'roll': roll
+              }
+
+              # If there were previous results, pass them along to the next step
+              if event.get("results"):
+                  return_value["lastResults"] = event.get("results")
+                  return_value["bet"] = event["results"].get("bet")
+              else:
+                  return_value["bet"] = event.get("bet")
+
+              return return_value
+
+  CrapsGameLogicLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CrapsLambdaRole.Arn
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import json
+
+          def lambda_handler(event, context):
+              point = None
+              # extract the roll and the bet type from the event
+              dice1_roll = event[0]["roll"]
+              dice2_roll = event[1]["roll"]
+              last_roll = dice1_roll + dice2_roll
+
+              bet_type = event[0].get("bet")
+              last_results = event[0].get("lastResults")
+
+              # if the bet isn't explictly specified as "don't pass", default to "pass line"
+              if bet_type != "don't pass":
+                  bet_type = "pass line"
+
+              return_value = {
+                  'lastRoll': [dice1_roll, dice2_roll],
+                  'rolled': last_roll,
+                  'point': point,
+                  'rollHistory': [],
+                  'outcome': None,
+                  'bet': bet_type
+              }
+
+              # If there are last results, there was a previous roll.
+              # Use the previous roll history and point.
+              if last_results:
+                  point = last_results["point"]
+
+                  return_value["rollHistory"] = last_results["rollHistory"]
+                  return_value["rollHistory"].append(last_roll)
+                  return_value["point"] = point
+                  
+                  # if there is a point established (if there was a previous roll there is) and you
+                  # roll a 7, you lose, if you roll the point, you win, otherwise keep rolling (no outcome).
+                  if last_roll == 7:
+                      return_value["outcome"] = "Lose"
+                  elif last_roll == point:
+                      return_value["outcome"] = "Win"
+
+              # if there were no last results, this is the first roll. 
+              else:
+
+                  # if the shooter rolls a 7 or 11 on the first roll, it's a win.
+                  if last_roll in [7, 11]:
+                      return_value["outcome"] = "Win"
+                  # if the shooter rolls a 2, 3, or 12 on the first roll, its a loss.
+                  elif last_roll in [2, 3, 12]:
+                      return_value["outcome"] = "Lose"
+                  # any other number rolled becomes the point.
+                  else:
+                      return_value["point"] = last_roll
+
+                  # since this is the first roll, create the roll history.
+                  return_value["rollHistory"] = [last_roll]
+
+              # since the "don't pass" bet is the inverse of the pass line bet
+              # simply return inverse outcome.
+              if bet_type == "don't pass":
+                  if return_value["outcome"] == "Win":
+                      return_value["outcome"] = "Lose"
+                  elif return_value["outcome"] == "Lose":
+                      return_value["outcome"] = "Win"
+
+              return {"results": return_value}
